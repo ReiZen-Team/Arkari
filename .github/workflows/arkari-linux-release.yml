@@ -1,0 +1,110 @@
+name: Arkari Linux Toolchain
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish the toolchain under"
+        type: string
+        required: false
+        default: "arkari-linux"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: arkari-linux-toolchain
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      TAG: ${{ github.event.inputs.tag || 'arkari-linux' }}
+      ASSET: arkari-clang-linux-x86_64.tar.xz
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Free disk space
+        run: |
+          set -euxo pipefail
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune --all --force || true
+          df -h /
+
+      - name: Install tooling
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang lld python3 zlib1g-dev ccache xz-utils
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: arkari-linux-ccache-${{ github.sha }}
+          restore-keys: arkari-linux-ccache-
+
+      - name: Configure
+        run: |
+          set -euxo pipefail
+          cmake -S llvm -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DLLVM_USE_LINKER=lld \
+            -DLLVM_ENABLE_PROJECTS="clang;lld" \
+            -DLLVM_TARGETS_TO_BUILD="X86;AArch64" \
+            -DLLVM_ENABLE_ASSERTIONS=OFF \
+            -DLLVM_ENABLE_LIBXML2=OFF \
+            -DLLVM_ENABLE_ZSTD=OFF \
+            -DLLVM_ENABLE_TERMINFO=OFF \
+            -DLLVM_ENABLE_ZLIB=ON \
+            -DLLVM_INCLUDE_TESTS=OFF \
+            -DLLVM_INCLUDE_BENCHMARKS=OFF \
+            -DLLVM_INCLUDE_EXAMPLES=OFF \
+            -DLLVM_INCLUDE_DOCS=OFF \
+            -DLLVM_STATIC_LINK_CXX_STDLIB=ON \
+            -DLLVM_CCACHE_BUILD=ON \
+            -DLLVM_PARALLEL_LINK_JOBS=1 \
+            -DCMAKE_INSTALL_PREFIX="${GITHUB_WORKSPACE}/install"
+
+      - name: Build and install clang / lld
+        run: |
+          set -euxo pipefail
+          ninja -C build \
+            install-clang \
+            install-clang-resource-headers \
+            install-lld \
+            install-llvm-strip \
+            install-llvm-ar \
+            install-llvm-ranlib \
+            install-llvm-nm \
+            install-llvm-objcopy
+          test -x install/bin/clang
+          ln -sf clang install/bin/clang++ || true
+          install/bin/clang --version
+
+      - name: Package
+        run: |
+          set -euxo pipefail
+          tar -C install -cJf "${ASSET}" .
+          ls -lh "${ASSET}"
+
+      - name: Publish release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euxo pipefail
+          if ! gh release view "${TAG}" >/dev/null 2>&1; then
+            gh release create "${TAG}" \
+              --title "Arkari Linux toolchain" \
+              --notes "Prebuilt Arkari clang/lld (Linux x86_64 host, targets X86;AArch64). Consumed by ReiZen-Team/Shouko obfuscated builds." \
+              --latest=false
+          fi
+          gh release upload "${TAG}" "${ASSET}" --clobber
