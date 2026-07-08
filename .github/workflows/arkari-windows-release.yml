@@ -1,0 +1,110 @@
+name: Arkari Windows Toolchain
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish the toolchain under"
+        type: string
+        required: false
+        default: "arkari-windows"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: arkari-windows-toolchain
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 350
+    env:
+      TAG: ${{ github.event.inputs.tag || 'arkari-windows' }}
+      ASSET: arkari-clang-windows-x86_64.zip
+      # sccache keeps the cache small and fast; MSVC is the supported host
+      # toolchain for building LLVM on Windows.
+      SCCACHE_GHA_ENABLED: "true"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Ninja
+        run: choco install ninja --no-progress -y
+
+      - name: Set up MSVC (x64) developer environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.6
+
+      # LLVM's build tree is large; make sure the temp/build drive has room.
+      - name: Show disk space
+        shell: pwsh
+        run: Get-PSDrive -PSProvider FileSystem
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          cmake -S llvm -B build -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_C_COMPILER=cl `
+            -DCMAKE_CXX_COMPILER=cl `
+            -DCMAKE_C_COMPILER_LAUNCHER=sccache `
+            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache `
+            -DLLVM_ENABLE_PROJECTS="clang;lld" `
+            -DLLVM_TARGETS_TO_BUILD="X86;AArch64" `
+            -DLLVM_ENABLE_ASSERTIONS=OFF `
+            -DLLVM_ENABLE_LIBXML2=OFF `
+            -DLLVM_ENABLE_ZSTD=OFF `
+            -DLLVM_ENABLE_TERMINFO=OFF `
+            -DLLVM_ENABLE_ZLIB=OFF `
+            -DLLVM_INCLUDE_TESTS=OFF `
+            -DLLVM_INCLUDE_BENCHMARKS=OFF `
+            -DLLVM_INCLUDE_EXAMPLES=OFF `
+            -DLLVM_INCLUDE_DOCS=OFF `
+            -DLLVM_USE_CRT_RELEASE=MT `
+            -DLLVM_PARALLEL_LINK_JOBS=1 `
+            -DCMAKE_INSTALL_PREFIX="${{ github.workspace }}/install"
+
+      - name: Build and install clang / lld
+        shell: pwsh
+        run: |
+          ninja -C build `
+            install-clang `
+            install-clang-resource-headers `
+            install-lld `
+            install-llvm-strip `
+            install-llvm-ar `
+            install-llvm-ranlib `
+            install-llvm-nm `
+            install-llvm-objcopy
+          & "install/bin/clang.exe" --version
+
+      - name: Package
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "install/*" -DestinationPath "$env:ASSET" -Force
+          Get-Item "$env:ASSET" | Format-List Name,Length
+
+      - name: Publish release asset
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if (-not (gh release view "$env:TAG" 2>$null)) {
+            gh release create "$env:TAG" `
+              --title "Arkari Windows toolchain" `
+              --notes "Prebuilt Arkari clang/lld (Windows x86_64 host, targets X86;AArch64). Consumed by ReiZen-Team/Shouko obfuscated builds and the THGensouEclipse Windows build." `
+              --latest=false
+          }
+          gh release upload "$env:TAG" "$env:ASSET" --clobber
